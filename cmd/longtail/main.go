@@ -2018,6 +2018,7 @@ var (
 	showStats          = kingpin.Flag("show-stats", "Output brief stats summary").Bool()
 	includeFilterRegEx = kingpin.Flag("include-filter-regex", "Optional include regex filter for assets in --source-path on upsync and --target-path on downsync. Separate regexes with **").String()
 	excludeFilterRegEx = kingpin.Flag("exclude-filter-regex", "Optional exclude regex filter for assets in --source-path on upsync and --target-path on downsync. Separate regexes with **").String()
+	memTrace           = kingpin.Flag("mem-trace", "Output memory statistics from longtail").Bool()
 
 	commandUpsync           = kingpin.Command("upsync", "Upload a folder")
 	commandUpsyncStorageURI = commandUpsync.Flag("storage-uri", "Storage URI (only local file system and GCS bucket URI supported)").Required().String()
@@ -2123,7 +2124,14 @@ func main() {
 	longtaillib.SetAssert(&assertData{})
 	defer longtaillib.SetAssert(nil)
 
-	switch kingpin.Parse() {
+	p := kingpin.Parse()
+
+	if *memTrace {
+		longtaillib.EnableMemtrace()
+		defer longtaillib.DisableMemtrace()
+	}
+
+	switch p {
 	case commandUpsync.FullCommand():
 		err := upSyncVersion(
 			*commandUpsyncStorageURI,

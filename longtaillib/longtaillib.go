@@ -1314,8 +1314,8 @@ func GetZStdMaxCompressionType() uint32 {
 }
 
 // LongtailAlloc ...
-func LongtailAlloc(size uint64) unsafe.Pointer {
-	return C.Longtail_Alloc(C.size_t(size))
+func LongtailAlloc(context string, size uint64) unsafe.Pointer {
+	return C.Longtail_Alloc(C.CString(context), C.size_t(size))
 }
 
 // LongtailFree ...
@@ -2221,4 +2221,14 @@ func AssertProxy_Assert(expression *C.char, file *C.char, line C.int) {
 	if activeAssert != nil {
 		activeAssert.OnAssert(C.GoString(expression), C.GoString(file), int(line))
 	}
+}
+
+//EnableMemtrace ...
+func EnableMemtrace() {
+	C.EnableMemtrace()
+}
+
+//EnableMemtrace ...
+func DisableMemtrace() {
+	C.DisableMemtrace()
 }
