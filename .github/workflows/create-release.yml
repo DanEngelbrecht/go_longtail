@@ -124,6 +124,7 @@ jobs:
           - **UPDATE** Longtail 0.1.15
           - **UPDATE** Longtail 0.1.16
           - **CHANGED** Expose `Longtail_BlockIndex.Copy()` and `Longtail_StoreIndex.Copy()`
+          - **ADDED** Added AWS S3 support - use `s3://` prefix for AWS S3 paths
           - **ADDED** Added `--mem-trace` that displays diagnostics about memory usage in longtaillib
           - **ADDED** Exposed `Longtail_MemTracer_DumpStats` which writes memory stats to `longtail.csv` if `--mem-trace` is enabled
         draft: false

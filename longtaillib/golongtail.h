@@ -51,9 +51,9 @@ struct BlockStoreAPIProxy
 static void* BlockStoreAPIProxy_GetContext(void* api) { return ((struct BlockStoreAPIProxy*)api)->m_Context; }
 void BlockStoreAPIProxy_Dispose(struct Longtail_API* api);
 int BlockStoreAPIProxy_PutStoredBlock(struct Longtail_BlockStoreAPI* api, struct Longtail_StoredBlock* stored_block, struct Longtail_AsyncPutStoredBlockAPI* async_complete_api);
-int BlockStoreAPIProxy_PreflightGet(struct Longtail_BlockStoreAPI* block_store_api, uint64_t chunk_count, TLongtail_Hash* chunk_hashes);
+int BlockStoreAPIProxy_PreflightGet(struct Longtail_BlockStoreAPI* block_store_api, uint32_t chunk_count, TLongtail_Hash* chunk_hashes);
 int BlockStoreAPIProxy_GetStoredBlock(struct Longtail_BlockStoreAPI* api, uint64_t block_hash, struct Longtail_AsyncGetStoredBlockAPI* async_complete_api);
-int BlockStoreAPIProxy_GetExistingContent(struct Longtail_BlockStoreAPI* api, uint64_t chunk_count, TLongtail_Hash* chunk_hashes, uint32_t min_block_usage_percent, struct Longtail_AsyncGetExistingContentAPI* async_complete_api);
+int BlockStoreAPIProxy_GetExistingContent(struct Longtail_BlockStoreAPI* api, uint32_t chunk_count, TLongtail_Hash* chunk_hashes, uint32_t min_block_usage_percent, struct Longtail_AsyncGetExistingContentAPI* async_complete_api);
 int BlockStoreAPIProxy_GetStats(struct Longtail_BlockStoreAPI* api, struct Longtail_BlockStore_Stats* out_stats);
 int BlockStoreAPIProxy_Flush(struct Longtail_BlockStoreAPI* api, struct Longtail_AsyncFlushAPI* async_complete_api);
 
@@ -169,7 +169,7 @@ struct AsyncGetExistingContentAPIProxy
 };
 
 static void* AsyncGetExistingContentAPIProxy_GetContext(void* api) { return ((struct AsyncGetExistingContentAPIProxy*)api)->m_Context; }
-void AsyncGetExistingContentAPIProxy_OnComplete(struct Longtail_AsyncGetExistingContentAPI* async_complete_api, struct Longtail_ContentIndex* content_index, int err);
+void AsyncGetExistingContentAPIProxy_OnComplete(struct Longtail_AsyncGetExistingContentAPI* async_complete_api, struct Longtail_StoreIndex* store_index, int err);
 void AsyncGetExistingContentAPIProxy_Dispose(struct Longtail_API* api);
 
 static struct Longtail_AsyncGetExistingContentAPI* CreateAsyncGetExistingContentAPI(void* context)
@@ -226,7 +226,7 @@ static void EnableMemtrace() {
 
 static void DisableMemtrace() {
     Longtail_SetAllocAndFree(0,  0);
-    Longtail_MemTracer_Dispose(Longtail_GetMemTracerDetailed());
+    Longtail_MemTracer_Dispose(Longtail_GetMemTracerSummary());
 }
 
 #ifdef __cplusplus

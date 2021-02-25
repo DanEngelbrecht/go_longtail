@@ -58,14 +58,14 @@ func (a *testGetBlockCompletionAPI) OnComplete(storedBlock Longtail_StoredBlock,
 }
 
 type testGetExistingContentCompletionAPI struct {
-	wg           sync.WaitGroup
-	contentIndex Longtail_ContentIndex
-	errno        int
+	wg         sync.WaitGroup
+	storeIndex Longtail_StoreIndex
+	errno      int
 }
 
-func (a *testGetExistingContentCompletionAPI) OnComplete(contentIndex Longtail_ContentIndex, errno int) {
+func (a *testGetExistingContentCompletionAPI) OnComplete(storeIndex Longtail_StoreIndex, errno int) {
 	a.errno = errno
-	a.contentIndex = contentIndex
+	a.storeIndex = storeIndex
 	a.wg.Done()
 }
 
@@ -428,13 +428,11 @@ func TestFSBlockStore(t *testing.T) {
 }
 
 type TestBlockStore struct {
-	blocks            map[uint64]Longtail_StoredBlock
-	maxBlockSize      uint32
-	maxChunksPerBlock uint32
-	blockStoreAPI     Longtail_BlockStoreAPI
-	lock              sync.Mutex
-	stats             [Longtail_BlockStoreAPI_StatU64_Count]uint64
-	didClose          bool
+	blocks        map[uint64]Longtail_StoredBlock
+	blockStoreAPI Longtail_BlockStoreAPI
+	lock          sync.Mutex
+	stats         [Longtail_BlockStoreAPI_StatU64_Count]uint64
+	didClose      bool
 }
 
 func (b *TestBlockStore) PutStoredBlock(
@@ -516,22 +514,20 @@ func (b *TestBlockStore) GetExistingContent(
 	b.stats[Longtail_BlockStoreAPI_StatU64_GetExistingContent_Count] += 1
 	sIndex, errno := b.GetIndexSync()
 	if errno != 0 {
-		asyncCompleteAPI.OnComplete(Longtail_ContentIndex{}, errno)
+		asyncCompleteAPI.OnComplete(Longtail_StoreIndex{}, errno)
 		return 0
 	}
 	defer sIndex.Dispose()
 
-	cExistingIndex, errno := GetExistingContentIndex(
+	sExistingIndex, errno := GetExistingStoreIndex(
 		sIndex,
 		chunkHashes,
-		minBlockUsagePercent,
-		b.maxBlockSize,
-		b.maxChunksPerBlock)
+		minBlockUsagePercent)
 	if errno != 0 {
-		asyncCompleteAPI.OnComplete(Longtail_ContentIndex{}, errno)
+		asyncCompleteAPI.OnComplete(Longtail_StoreIndex{}, errno)
 		return 0
 	}
-	asyncCompleteAPI.OnComplete(cExistingIndex, 0)
+	asyncCompleteAPI.OnComplete(sExistingIndex, 0)
 	return 0
 }
 
@@ -562,7 +558,7 @@ func TestBlockStoreProxy(t *testing.T) {
 	defer SetAssert(nil)
 	SetLogLevel(1)
 
-	blockStore := &TestBlockStore{blocks: make(map[uint64]Longtail_StoredBlock), maxBlockSize: 65536, maxChunksPerBlock: 1024, didClose: false}
+	blockStore := &TestBlockStore{blocks: make(map[uint64]Longtail_StoredBlock), didClose: false}
 	blockStoreProxy := CreateBlockStoreAPI(blockStore)
 	blockStore.blockStoreAPI = blockStoreProxy
 	defer blockStoreProxy.Dispose()
@@ -632,7 +628,7 @@ func TestBlockStoreProxyFull(t *testing.T) {
 	defer chunkerAPI.Dispose()
 	jobAPI := CreateBikeshedJobAPI(uint32(runtime.NumCPU()), 0)
 	defer jobAPI.Dispose()
-	testBlockStore := &TestBlockStore{blocks: make(map[uint64]Longtail_StoredBlock), maxBlockSize: 65536, maxChunksPerBlock: 1024}
+	testBlockStore := &TestBlockStore{blocks: make(map[uint64]Longtail_StoredBlock)}
 	blockStoreAPI := CreateBlockStoreAPI(testBlockStore)
 	defer blockStoreAPI.Dispose()
 
@@ -667,12 +663,12 @@ func TestBlockStoreProxyFull(t *testing.T) {
 		getExistingContentComplete.wg.Done()
 	}
 	getExistingContentComplete.wg.Wait()
-	blockStoreContentIndex := getExistingContentComplete.contentIndex
-	defer blockStoreContentIndex.Dispose()
+	blockStoreIndex := getExistingContentComplete.storeIndex
+	defer blockStoreIndex.Dispose()
 
-	missingContentIndex, errno := CreateMissingContent(
+	missingStoreIndex, errno := CreateMissingContent(
 		hashAPI,
-		blockStoreContentIndex,
+		blockStoreIndex,
 		versionIndex,
 		32768*2,
 		8)
@@ -680,14 +676,14 @@ func TestBlockStoreProxyFull(t *testing.T) {
 		t.Errorf("TestBlockStoreProxyFull() CreateMissingContent() %d != %d", errno, 0)
 		getExistingContentComplete.wg.Done()
 	}
-	defer missingContentIndex.Dispose()
+	defer missingStoreIndex.Dispose()
 
 	errno = WriteContent(
 		storageAPI,
 		blockStoreAPI,
 		jobAPI,
 		nil,
-		missingContentIndex,
+		missingStoreIndex,
 		versionIndex,
 		"content")
 	if errno != 0 {
@@ -777,37 +773,6 @@ func TestCreateVersionIndex(t *testing.T) {
 	}
 }
 
-func TestCreateContentIndex(t *testing.T) {
-	hashAPI := CreateBlake3HashAPI()
-	defer hashAPI.Dispose()
-	chunkHashes := make([]uint64, 2)
-	chunkHashes[0] = 4711
-	chunkHashes[1] = 1147
-	chunkSizes := make([]uint32, 2)
-	chunkSizes[0] = 889
-	chunkSizes[0] = 998
-	compressionTypes := make([]uint32, 2)
-	compressionTypes[0] = GetZStdDefaultCompressionType()
-	compressionTypes[1] = GetZStdDefaultCompressionType()
-	contentIndex, errno := CreateContentIndexRaw(
-		hashAPI,
-		chunkHashes,
-		chunkSizes,
-		compressionTypes,
-		65536,
-		4096)
-	if errno != 0 {
-		t.Errorf("TestCreateContentIndex() CreateContentIndex() %d != %d", errno, 0)
-	}
-	defer contentIndex.Dispose()
-	if contentIndex.GetChunkCount() != uint64(len(chunkHashes)) {
-		t.Errorf("TestCreateContentIndex() GetChunkCount() %d != %d", contentIndex.GetChunkCount(), len(chunkHashes))
-	}
-	if contentIndex.GetBlockCount() != 1 {
-		t.Errorf("TestCreateContentIndex() GetChunkCount() %d != %d", contentIndex.GetBlockCount(), 1)
-	}
-}
-
 func TestRewriteVersion(t *testing.T) {
 	storageAPI := createFilledStorage("content")
 	fileInfos, errno := GetFilesRecursively(storageAPI, Longtail_PathFilterAPI{}, "content")
@@ -838,15 +803,15 @@ func TestRewriteVersion(t *testing.T) {
 		t.Errorf("TestRewriteVersion() CreateVersionIndex() %d != %d", errno, 0)
 	}
 
-	contentIndex, errno := CreateContentIndex(
+	storeIndex, errno := CreateStoreIndex(
 		hashAPI,
 		versionIndex,
 		65536,
 		4096)
 	if errno != 0 {
-		t.Errorf("TestRewriteVersion() CreateContentIndex() %d != %d", errno, 0)
+		t.Errorf("TestRewriteVersion() CreateStoreIndex() %d != %d", errno, 0)
 	}
-	defer contentIndex.Dispose()
+	defer storeIndex.Dispose()
 	blockStorageAPI := CreateFSBlockStore(jobAPI, storageAPI, "block_store", 65536, 4096)
 	defer blockStorageAPI.Dispose()
 	compressionRegistry := CreateZStdCompressionRegistry()
@@ -859,7 +824,7 @@ func TestRewriteVersion(t *testing.T) {
 		blockStorageAPI,
 		jobAPI,
 		&writeContentProgress,
-		contentIndex,
+		storeIndex,
 		versionIndex,
 		"content")
 	if errno != 0 {
@@ -874,8 +839,8 @@ func TestRewriteVersion(t *testing.T) {
 		getExistingContentComplete.wg.Done()
 	}
 	getExistingContentComplete.wg.Wait()
-	retargetedContentIndex := getExistingContentComplete.contentIndex
-	defer retargetedContentIndex.Dispose()
+	existingStoreIndex := getExistingContentComplete.storeIndex
+	defer existingStoreIndex.Dispose()
 
 	writeVersionProgress2 := CreateProgress(t, "WriteVersion")
 	errno = WriteVersion(
@@ -883,7 +848,7 @@ func TestRewriteVersion(t *testing.T) {
 		storageAPI,
 		jobAPI,
 		&writeVersionProgress2,
-		retargetedContentIndex,
+		existingStoreIndex,
 		versionIndex,
 		"content_copy",
 		true)

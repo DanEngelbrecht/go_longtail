@@ -16,8 +16,6 @@ func TestCreateRemoteBlobStore(t *testing.T) {
 	remoteStore, err := NewRemoteBlockStore(
 		jobs,
 		blobStore,
-		8192,
-		128,
 		ReadOnly)
 	if err != nil {
 		t.Errorf("TestCreateRemoveBlobStore() NewRemoteBlockStore()) %v != %v", err, nil)
@@ -27,13 +25,13 @@ func TestCreateRemoteBlobStore(t *testing.T) {
 }
 
 type getExistingContentCompletionAPI struct {
-	wg            sync.WaitGroup
-	content_index longtaillib.Longtail_ContentIndex
-	err           int
+	wg         sync.WaitGroup
+	storeIndex longtaillib.Longtail_StoreIndex
+	err        int
 }
 
-func (a *getExistingContentCompletionAPI) OnComplete(content_index longtaillib.Longtail_ContentIndex, errno int) {
-	a.content_index = content_index
+func (a *getExistingContentCompletionAPI) OnComplete(storeIndex longtaillib.Longtail_StoreIndex, errno int) {
+	a.storeIndex = storeIndex
 	a.err = errno
 	a.wg.Done()
 }
@@ -60,16 +58,16 @@ func (a *getStoredBlockCompletionAPI) OnComplete(storedBlock longtaillib.Longtai
 	a.wg.Done()
 }
 
-func getExistingContent(t *testing.T, storeAPI longtaillib.Longtail_BlockStoreAPI, chunkHashes []uint64, minBlockUsagePercent uint32) (longtaillib.Longtail_ContentIndex, int) {
+func getExistingContent(t *testing.T, storeAPI longtaillib.Longtail_BlockStoreAPI, chunkHashes []uint64, minBlockUsagePercent uint32) (longtaillib.Longtail_StoreIndex, int) {
 	g := &getExistingContentCompletionAPI{}
 	g.wg.Add(1)
 	errno := storeAPI.GetExistingContent(chunkHashes, minBlockUsagePercent, longtaillib.CreateAsyncGetExistingContentAPI(g))
 	if errno != 0 {
 		g.wg.Done()
-		return longtaillib.Longtail_ContentIndex{}, errno
+		return longtaillib.Longtail_StoreIndex{}, errno
 	}
 	g.wg.Wait()
-	return g.content_index, g.err
+	return g.storeIndex, g.err
 }
 
 func TestEmptyGetExistingContent(t *testing.T) {
@@ -79,8 +77,6 @@ func TestEmptyGetExistingContent(t *testing.T) {
 	remoteStore, err := NewRemoteBlockStore(
 		jobs,
 		blobStore,
-		8192,
-		128,
 		ReadOnly)
 	if err != nil {
 		t.Errorf("TestCreateRemoveBlobStore() NewRemoteBlockStore()) %v != %v", err, nil)
@@ -106,74 +102,6 @@ func TestEmptyGetExistingContent(t *testing.T) {
 	defer storeAPI.Dispose()
 }
 
-func generateStoredBlock(t *testing.T, seed uint8) (longtaillib.Longtail_StoredBlock, int) {
-	chunkHashes := []uint64{uint64(seed) + 1, uint64(seed) + 2, uint64(seed) + 3}
-	chunkSizes := []uint32{uint32(seed) + 10, uint32(seed) + 20, uint32(seed) + 30}
-
-	blockDataLen := (int)(chunkSizes[0] + chunkSizes[1] + chunkSizes[2])
-	blockData := make([]uint8, blockDataLen)
-	for p := 0; p < blockDataLen; p++ {
-		blockData[p] = seed
-	}
-
-	return longtaillib.CreateStoredBlock(
-		uint64(seed)+21412151,
-		997,
-		2,
-		chunkHashes,
-		chunkSizes,
-		blockData,
-		false)
-}
-
-func storeBlockFromSeed(t *testing.T, storeAPI longtaillib.Longtail_BlockStoreAPI, seed uint8) (uint64, int) {
-	storedBlock, errno := generateStoredBlock(t, seed)
-	if errno != 0 {
-		return 0, errno
-	}
-
-	p := &putStoredBlockCompletionAPI{}
-	p.wg.Add(1)
-	errno = storeAPI.PutStoredBlock(storedBlock, longtaillib.CreateAsyncPutStoredBlockAPI(p))
-	if errno != 0 {
-		p.wg.Done()
-		storedBlock.Dispose()
-		return 0, errno
-	}
-	p.wg.Wait()
-
-	return uint64(seed) + 21412151, p.err
-}
-
-func fetchBlockFromStore(t *testing.T, storeAPI longtaillib.Longtail_BlockStoreAPI, blockHash uint64) (longtaillib.Longtail_StoredBlock, int) {
-	g := &getStoredBlockCompletionAPI{}
-	g.wg.Add(1)
-	errno := storeAPI.GetStoredBlock(blockHash, longtaillib.CreateAsyncGetStoredBlockAPI(g))
-	if errno != 0 {
-		g.wg.Done()
-		return longtaillib.Longtail_StoredBlock{}, errno
-	}
-	g.wg.Wait()
-
-	return g.storedBlock, g.err
-}
-
-func validateBlockFromSeed(t *testing.T, seed uint8, storedBlock longtaillib.Longtail_StoredBlock) {
-	if !storedBlock.IsValid() {
-		t.Errorf("validateBlockFromSeed() g.err %t != %t", storedBlock.IsValid(), true)
-	}
-
-	storedBlockIndex := storedBlock.GetBlockIndex()
-
-	if storedBlockIndex.GetBlockHash() != uint64(seed)+21412151 {
-		t.Errorf("validateBlockFromSeed() storedBlockIndex.GetBlockHash() %d != %d", storedBlockIndex.GetBlockHash(), uint64(seed)+21412151)
-	}
-
-	if storedBlockIndex.GetChunkCount() != 3 {
-		t.Errorf("validateBlockFromSeed() storedBlockIndex.GetChunkCount() %d != %d", storedBlockIndex.GetChunkCount(), 3)
-	}
-}
-
 func TestPutGetStoredBlock(t *testing.T) {
 	blobStore, _ := NewTestBlobStore("the_path")
 	jobs := longtaillib.CreateBikeshedJobAPI(uint32(runtime.NumCPU()), 0)
@@ -181,18 +109,19 @@ func TestPutGetStoredBlock(t *testing.T) {
 	remoteStore, err := NewRemoteBlockStore(
 		jobs,
 		blobStore,
-		8192,
-		128,
 		ReadWrite)
 	if err != nil {
 		t.Errorf("TestPutGetStoredBlock() NewRemoteBlockStore()) %v != %v", err, nil)
 	}
 	storeAPI := longtaillib.CreateBlockStoreAPI(remoteStore)
 
-	blockHash, errno := storeBlockFromSeed(t, storeAPI, 0)
+	block, errno := storeBlockFromSeed(t, storeAPI, 0)
 	if errno != 0 {
 		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
 	}
+	defer block.Dispose()
+	blockIndex := block.GetBlockIndex()
+	blockHash := blockIndex.GetBlockHash()
 
 	storedBlockCopy, errno := fetchBlockFromStore(t, storeAPI, blockHash)
 	if errno != 0 {
@@ -226,8 +155,6 @@ func TestGetExistingContent(t *testing.T) {
 	remoteStore, err := NewRemoteBlockStore(
 		jobs,
 		blobStore,
-		8192,
-		128,
 		ReadWrite)
 	if err != nil {
 		t.Errorf("TestPutGetStoredBlock() NewRemoteBlockStore()) %v != %v", err, nil)
@@ -235,32 +162,56 @@ func TestGetExistingContent(t *testing.T) {
 	storeAPI := longtaillib.CreateBlockStoreAPI(remoteStore)
 	defer storeAPI.Dispose()
 
-	_, errno := storeBlockFromSeed(t, storeAPI, 0)
+	b1, errno := storeBlockFromSeed(t, storeAPI, 0)
 	if errno != 0 {
 		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
 	}
-	_, errno = storeBlockFromSeed(t, storeAPI, 10)
-	if errno != 0 {
-		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
-	}
-	_, errno = storeBlockFromSeed(t, storeAPI, 20)
-	if errno != 0 {
-		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
-	}
-	_, errno = storeBlockFromSeed(t, storeAPI, 30)
-	if errno != 0 {
-		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
-	}
-	_, errno = storeBlockFromSeed(t, storeAPI, 40)
-	if errno != 0 {
-		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
-	}
-	_, errno = storeBlockFromSeed(t, storeAPI, 50)
-	if errno != 0 {
-		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
-	}
+	defer b1.Dispose()
 
-	chunkHashes := []uint64{uint64(0) + 1, uint64(0) + 2, uint64(10) + 1, uint64(10) + 3, uint64(20) + 1, uint64(20) + 2, uint64(30) + 2, uint64(30) + 3, uint64(40) + 1, uint64(40) + 3, uint64(50) + 1}
+	b2, errno := storeBlockFromSeed(t, storeAPI, 10)
+	if errno != 0 {
+		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
+	}
+	defer b2.Dispose()
+
+	b3, errno := storeBlockFromSeed(t, storeAPI, 20)
+	if errno != 0 {
+		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
+	}
+	defer b3.Dispose()
+
+	b4, errno := storeBlockFromSeed(t, storeAPI, 30)
+	if errno != 0 {
+		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
+	}
+	defer b4.Dispose()
+
+	b5, errno := storeBlockFromSeed(t, storeAPI, 40)
+	if errno != 0 {
+		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
+	}
+	defer b5.Dispose()
+
+	b6, errno := storeBlockFromSeed(t, storeAPI, 50)
+	if errno != 0 {
+		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
+	}
+	defer b6.Dispose()
+
+	b1Index := b1.GetBlockIndex()
+	b2Index := b2.GetBlockIndex()
+	b3Index := b3.GetBlockIndex()
+	b4Index := b4.GetBlockIndex()
+	b5Index := b5.GetBlockIndex()
+	b6Index := b6.GetBlockIndex()
+
+	chunkHashes := []uint64{
+		b1Index.GetChunkHashes()[0], b1Index.GetChunkHashes()[1],
+		b2Index.GetChunkHashes()[0], b2Index.GetChunkHashes()[1],
+		b3Index.GetChunkHashes()[0], b3Index.GetChunkHashes()[1],
+		b4Index.GetChunkHashes()[0], b4Index.GetChunkHashes()[1],
+		b5Index.GetChunkHashes()[0], b5Index.GetChunkHashes()[1],
+		b6Index.GetChunkHashes()[0]}
 
 	remoteStoreFlushComplete := &flushCompletionAPI{}
 	remoteStoreFlushComplete.wg.Add(1)
@@ -270,15 +221,15 @@ func TestGetExistingContent(t *testing.T) {
 	existingContent, errno := getExistingContent(t, storeAPI, chunkHashes, 0)
 	defer existingContent.Dispose()
 	if !existingContent.IsValid() {
-		t.Errorf("TestEmptyGetExistingContent() g.err %t != %t", existingContent.IsValid(), true)
+		t.Errorf("TestGetExistingContent() g.err %t != %t", existingContent.IsValid(), true)
 	}
 
 	if existingContent.GetBlockCount() != 6 {
-		t.Errorf("TestEmptyGetExistingContent() existingContent.GetBlockCount() %d != %d", existingContent.GetBlockCount(), 6)
+		t.Errorf("TestGetExistingContent() existingContent.GetBlockCount() %d != %d", existingContent.GetBlockCount(), 6)
 	}
 
-	if existingContent.GetChunkCount() != 11 {
-		t.Errorf("TestEmptyGetExistingContent() existingContent.GetChunkCount() %d != %d", existingContent.GetChunkCount(), 10)
+	if existingContent.GetChunkCount() != 18 {
+		t.Errorf("TestGetExistingContent() existingContent.GetChunkCount() %d != %d", existingContent.GetChunkCount(), 18)
 	}
 }
 
@@ -289,101 +240,110 @@ func TestRestoreStore(t *testing.T) {
 	remoteStore, err := NewRemoteBlockStore(
 		jobs,
 		blobStore,
-		8192,
-		128,
 		ReadWrite)
 	if err != nil {
 		t.Errorf("TestPutGetStoredBlock() NewRemoteBlockStore()) %v != %v", err, nil)
 	}
 	storeAPI := longtaillib.CreateBlockStoreAPI(remoteStore)
 
-	_, errno := storeBlockFromSeed(t, storeAPI, 0)
+	b1, errno := storeBlockFromSeed(t, storeAPI, 0)
 	if errno != 0 {
 		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 0) %d != %d", errno, 0)
 	}
-	_, errno = storeBlockFromSeed(t, storeAPI, 10)
+	b1Index := b1.GetBlockIndex()
+	b1ChunkHashes := b1Index.GetChunkHashes()
+
+	b2, errno := storeBlockFromSeed(t, storeAPI, 10)
 	if errno != 0 {
 		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 10) %d != %d", errno, 0)
 	}
-	_, errno = storeBlockFromSeed(t, storeAPI, 20)
+	b2Index := b2.GetBlockIndex()
+	b2ChunkHashes := b2Index.GetChunkHashes()
+
+	b3, errno := storeBlockFromSeed(t, storeAPI, 20)
 	if errno != 0 {
 		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 20) %d != %d", errno, 0)
 	}
+	b3Index := b3.GetBlockIndex()
+	b3ChunkHashes := b3Index.GetChunkHashes()
+
+	chunkHashes1 := []uint64{b1ChunkHashes[0], b1ChunkHashes[1], b3ChunkHashes[1], b3ChunkHashes[2]}
+	chunkHashes2 := []uint64{b2ChunkHashes[0], b2ChunkHashes[1], b3ChunkHashes[0], b3ChunkHashes[1]}
+
+	b1.Dispose()
+	b2.Dispose()
+	b3.Dispose()
 
 	storeAPI.Dispose()
 
 	remoteStore, err = NewRemoteBlockStore(
 		jobs,
 		blobStore,
-		8192,
-		128,
 		ReadWrite)
 	if err != nil {
 		t.Errorf("TestPutGetStoredBlock() NewRemoteBlockStore()) %v != %v", err, nil)
 	}
 	storeAPI = longtaillib.CreateBlockStoreAPI(remoteStore)
 
-	chunkHashes := []uint64{uint64(0) + 1, uint64(0) + 2, uint64(10) + 1, uint64(10) + 3}
-
-	existingContent, errno := getExistingContent(t, storeAPI, chunkHashes, 0)
+	existingContent, errno := getExistingContent(t, storeAPI, chunkHashes1, 0)
 	if !existingContent.IsValid() {
-		t.Errorf("TestEmptyGetExistingContent() g.err %t != %t", existingContent.IsValid(), true)
+		t.Errorf("TestRestoreStore() g.err %t != %t", existingContent.IsValid(), true)
 	}
 
 	if existingContent.GetBlockCount() != 2 {
-		t.Errorf("TestEmptyGetExistingContent() existingContent.GetBlockCount() %d != %d", existingContent.GetBlockCount(), 2)
+		t.Errorf("TestRestoreStore() existingContent.GetBlockCount() %d != %d", existingContent.GetBlockCount(), 2)
 	}
 
-	if existingContent.GetChunkCount() != 4 {
-		t.Errorf("TestEmptyGetExistingContent() existingContent.GetChunkCount() %d != %d", existingContent.GetChunkCount(), 4)
+	if existingContent.GetChunkCount() != 6 {
+		t.Errorf("TestRestoreStore() existingContent.GetChunkCount() %d != %d", existingContent.GetChunkCount(), 6)
 	}
 
-	chunkHashes = []uint64{uint64(0) + 1, uint64(0) + 2, uint64(10) + 1, uint64(10) + 3, uint64(30) + 1}
-
-	existingContent, errno = getExistingContent(t, storeAPI, chunkHashes, 0)
+	existingContent, errno = getExistingContent(t, storeAPI, chunkHashes2, 0)
 	if !existingContent.IsValid() {
-		t.Errorf("TestEmptyGetExistingContent() g.err %t != %t", existingContent.IsValid(), true)
+		t.Errorf("TestRestoreStore() g.err %t != %t", existingContent.IsValid(), true)
 	}
 
 	if existingContent.GetBlockCount() != 2 {
-		t.Errorf("TestEmptyGetExistingContent() existingContent.GetBlockCount() %d != %d", existingContent.GetBlockCount(), 2)
+		t.Errorf("TestRestoreStore() existingContent.GetBlockCount() %d != %d", existingContent.GetBlockCount(), 2)
 	}
 
-	if existingContent.GetChunkCount() != 4 {
-		t.Errorf("TestEmptyGetExistingContent() existingContent.GetChunkCount() %d != %d", existingContent.GetChunkCount(), 4)
+	if existingContent.GetChunkCount() != 6 {
+		t.Errorf("TestRestoreStore() existingContent.GetChunkCount() %d != %d", existingContent.GetChunkCount(), 6)
 	}
 
-	_, errno = storeBlockFromSeed(t, storeAPI, 30)
+	b5, errno := storeBlockFromSeed(t, storeAPI, 30)
 	if errno != 0 {
-		t.Errorf("TestPutGetStoredBlock() storeBlock(t, storeAPI, 30) %d != %d", errno, 0)
+		t.Errorf("TestRestoreStore() storeBlock(t, storeAPI, 30) %d != %d", errno, 0)
 	}
+	b5Index := b5.GetBlockIndex()
+	b5ChunkHashes := b5Index.GetChunkHashes()
+	b5.Dispose()
+
+	chunkHashes3 := append(chunkHashes2, b5ChunkHashes[1])
+
 	existingContent.Dispose()
 	storeAPI.Dispose()
 
 	remoteStore, err = NewRemoteBlockStore(
 		jobs,
 		blobStore,
-		8192,
-		128,
 		ReadWrite)
 	if err != nil {
-		t.Errorf("TestPutGetStoredBlock() NewRemoteBlockStore()) %v != %v", err, nil)
+		t.Errorf("TestRestoreStore() NewRemoteBlockStore()) %v != %v", err, nil)
 	}
 	storeAPI = longtaillib.CreateBlockStoreAPI(remoteStore)
 
-	chunkHashes = []uint64{uint64(0) + 1, uint64(0) + 2, uint64(10) + 1, uint64(10) + 3, uint64(30) + 1}
-
-	existingContent, errno = getExistingContent(t, storeAPI, chunkHashes, 0)
+	existingContent, errno = getExistingContent(t, storeAPI, chunkHashes3, 0)
 	if !existingContent.IsValid() {
-		t.Errorf("TestEmptyGetExistingContent() g.err %t != %t", existingContent.IsValid(), true)
+		t.Errorf("TestRestoreStore() g.err %t != %t", existingContent.IsValid(), true)
 	}
 
 	if existingContent.GetBlockCount() != 3 {
-		t.Errorf("TestEmptyGetExistingContent() existingContent.GetBlockCount() %d != %d", existingContent.GetBlockCount(), 3)
+		t.Errorf("TestRestoreStore() existingContent.GetBlockCount() %d != %d", existingContent.GetBlockCount(), 3)
 	}
 
-	if existingContent.GetChunkCount() != 5 {
-		t.Errorf("TestEmptyGetExistingContent() existingContent.GetChunkCount() %d != %d", existingContent.GetChunkCount(), 5)
+	if existingContent.GetChunkCount() != 9 {
+		t.Errorf("TestRestoreStore() existingContent.GetChunkCount() %d != %d", existingContent.GetChunkCount(), 9)
 	}
 	existingContent.Dispose()
 	storeAPI.Dispose()
@@ -455,8 +415,6 @@ func TestBlockScanning(t *testing.T) {
 	remoteStore, err := NewRemoteBlockStore(
 		jobs,
 		blobStore,
-		8192,
-		128,
 		Init)
 	if err != nil {
 		t.Errorf("TestPutGetStoredBlock() NewRemoteBlockStore()) %v != %v", err, nil)

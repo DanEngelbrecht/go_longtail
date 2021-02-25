@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/DanEngelbrecht/golongtail/longtaillib"
 	"github.com/pkg/errors"
@@ -61,11 +60,9 @@ type pendingPrefetchedBlock struct {
 }
 
 type remoteStore struct {
-	jobAPI            longtaillib.Longtail_JobAPI
-	maxBlockSize      uint32
-	maxChunksPerBlock uint32
-	blobStore         BlobStore
-	defaultClient     BlobClient
+	jobAPI        longtaillib.Longtail_JobAPI
+	blobStore     BlobStore
+	defaultClient BlobClient
 
 	workerCount int
 
@@ -95,51 +92,7 @@ func (s *remoteStore) String() string {
 	return s.defaultClient.String()
 }
 
-func readBlobWithRetry(
-	ctx context.Context,
-	s *remoteStore,
-	client BlobClient,
-	key string) ([]byte, int, error) {
-	retryCount := 0
-	objHandle, err := client.NewObject(key)
-	if err != nil {
-		return nil, retryCount, err
-	}
-	exists, err := objHandle.Exists()
-	if err != nil {
-		return nil, retryCount, err
-	}
-	if !exists {
-		return nil, retryCount, longtaillib.ErrENOENT
-	}
-	blobData, err := objHandle.Read()
-	if err != nil {
-		log.Printf("Retrying getBlob %s in store %s\n", key, s.String())
-		retryCount++
-		blobData, err = objHandle.Read()
-	}
-	if err != nil {
-		log.Printf("Retrying 500 ms delayed getBlob %s in store %s\n", key, s.String())
-		time.Sleep(500 * time.Millisecond)
-		retryCount++
-		blobData, err = objHandle.Read()
-	}
-	if err != nil {
-		log.Printf("Retrying 2 s delayed getBlob %s in store %s\n", key, s.String())
-		time.Sleep(2 * time.Second)
-		retryCount++
-		blobData, err = objHandle.Read()
-	}
-
-	if err != nil {
-		return nil, retryCount, err
-	}
-
-	return blobData, retryCount, nil
-}
-
 func putStoredBlock(
-	ctx context.Context,
 	s *remoteStore,
 	blobClient BlobClient,
 	blockIndexMessages chan<- blockIndexMessage,
@@ -150,43 +103,20 @@ func putStoredBlock(
 	blockIndex := storedBlock.GetBlockIndex()
 	blockHash := blockIndex.GetBlockHash()
 	key := GetBlockPath("chunks", blockHash)
-	objHandle, err := blobClient.NewObject(key)
+	blob, errno := longtaillib.WriteStoredBlockToBuffer(storedBlock)
+	if errno != 0 {
+		return longtaillib.ErrnoToError(errno, longtaillib.ErrEIO)
+	}
+
+	retryCount, err := writeBlobWithRetry(blobClient, key, false, blob)
+	atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_PutStoredBlock_RetryCount], uint64(retryCount))
 	if err != nil {
+		atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_PutStoredBlock_FailCount], 1)
 		return err
 	}
-	if exists, err := objHandle.Exists(); err == nil && !exists {
-		blob, errno := longtaillib.WriteStoredBlockToBuffer(storedBlock)
-		if errno != 0 {
-			return longtaillib.ErrnoToError(errno, longtaillib.ErrEIO)
-		}
 
-		ok, err := objHandle.Write(blob)
-		if err != nil || !ok {
-			log.Printf("Retrying putBlob %s in store %s\n", key, s.String())
-			atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_PutStoredBlock_RetryCount], 1)
-			ok, err = objHandle.Write(blob)
-		}
-		if err != nil || !ok {
-			log.Printf("Retrying 500 ms delayed putBlob %s in store %s\n", key, s.String())
-			time.Sleep(500 * time.Millisecond)
-			atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_PutStoredBlock_RetryCount], 1)
-			ok, err = objHandle.Write(blob)
-		}
-		if err != nil || !ok {
-			log.Printf("Retrying 2 s delayed putBlob %s in store %s\n", key, s.String())
-			time.Sleep(2 * time.Second)
-			atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_PutStoredBlock_RetryCount], 1)
-			ok, err = objHandle.Write(blob)
-		}
-
-		if err != nil || !ok {
-			atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_PutStoredBlock_FailCount], 1)
-			return longtaillib.ErrnoToError(errno, longtaillib.ErrEIO)
-		}
-
-		atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_PutStoredBlock_Byte_Count], (uint64)(len(blob)))
-		atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_PutStoredBlock_Chunk_Count], (uint64)(blockIndex.GetChunkCount()))
-	}
+	atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_PutStoredBlock_Byte_Count], (uint64)(len(blob)))
+	atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_PutStoredBlock_Chunk_Count], (uint64)(blockIndex.GetChunkCount()))
 
 	blockIndexCopy, err := blockIndex.Copy()
 	if err != nil {
@@ -197,7 +127,6 @@ func putStoredBlock(
 }
 
 func getStoredBlock(
-	ctx context.Context,
 	s *remoteStore,
 	blobClient BlobClient,
 	blockHash uint64) (longtaillib.Longtail_StoredBlock, error) {
@@ -206,7 +135,7 @@ func getStoredBlock(
 
 	key := GetBlockPath("chunks", blockHash)
 
-	storedBlockData, retryCount, err := readBlobWithRetry(ctx, s, blobClient, key)
+	storedBlockData, retryCount, err := readBlobWithRetry(blobClient, key)
 	atomic.AddUint64(&s.stats.StatU64[longtaillib.Longtail_BlockStoreAPI_StatU64_GetStoredBlock_RetryCount], uint64(retryCount))
 
 	if err != nil || storedBlockData == nil {
@@ -255,7 +184,7 @@ func fetchBlock(
 	s.prefetchBlocks[getMsg.blockHash] = prefetchedBlock
 	s.fetchedBlocks[getMsg.blockHash] = true
 	s.fetchedBlocksSync.Unlock()
-	storedBlock, getStoredBlockErr := getStoredBlock(ctx, s, client, getMsg.blockHash)
+	storedBlock, getStoredBlockErr := getStoredBlock(s, client, getMsg.blockHash)
 	s.fetchedBlocksSync.Lock()
 	completeCallbacks := prefetchedBlock.completeCallbacks
 	delete(s.prefetchBlocks, getMsg.blockHash)
@@ -297,7 +226,7 @@ func prefetchBlock(
 	s.prefetchBlocks[prefetchMsg.blockHash] = prefetchedBlock
 	s.fetchedBlocksSync.Unlock()
 
-	storedBlock, getErr := getStoredBlock(ctx, s, client, prefetchMsg.blockHash)
+	storedBlock, getErr := getStoredBlock(s, client, prefetchMsg.blockHash)
 	if getErr != nil {
 		return
 	}
@@ -357,18 +286,18 @@ func remoteWorker(
 		select {
 		case putMsg, more := <-putBlockMessages:
 			if more {
-				received += 1
+				received++
 				if accessType == ReadOnly {
 					putMsg.asyncCompleteAPI.OnComplete(longtaillib.EACCES)
 					continue
 				}
-				err := putStoredBlock(ctx, s, client, blockIndexMessages, putMsg.storedBlock)
+				err := putStoredBlock(s, client, blockIndexMessages, putMsg.storedBlock)
 				putMsg.asyncCompleteAPI.OnComplete(longtaillib.ErrorToErrno(err, longtaillib.EIO))
 			} else {
 				run = false
 			}
 		case getMsg := <-getBlockMessages:
-			received += 1
+			received++
 			fetchBlock(ctx, s, client, getMsg)
 		default:
 		}
@@ -383,7 +312,7 @@ func remoteWorker(
 							putMsg.asyncCompleteAPI.OnComplete(longtaillib.EACCES)
 							continue
 						}
-						err := putStoredBlock(ctx, s, client, blockIndexMessages, putMsg.storedBlock)
+						err := putStoredBlock(s, client, blockIndexMessages, putMsg.storedBlock)
 						putMsg.asyncCompleteAPI.OnComplete(longtaillib.ErrorToErrno(err, longtaillib.EIO))
 					} else {
 						run = false
@@ -403,7 +332,7 @@ func remoteWorker(
 							putMsg.asyncCompleteAPI.OnComplete(longtaillib.EACCES)
 							continue
 						}
-						err := putStoredBlock(ctx, s, client, blockIndexMessages, putMsg.storedBlock)
+						err := putStoredBlock(s, client, blockIndexMessages, putMsg.storedBlock)
 						putMsg.asyncCompleteAPI.OnComplete(longtaillib.ErrorToErrno(err, longtaillib.EIO))
 					} else {
 						run = false
@@ -417,192 +346,13 @@ func remoteWorker(
 	return nil
 }
 
-func tryUpdateRemoteStoreIndex(
-	ctx context.Context,
-	updatedStoreIndex longtaillib.Longtail_StoreIndex,
-	objHandle BlobObject) (bool, error) {
-
-	exists, err := objHandle.LockWriteVersion()
-	if err != nil {
-		return false, err
-	}
-	if exists {
-		blob, err := objHandle.Read()
-		if err != nil {
-			return false, errors.Wrapf(err, "updateRemoteStoreIndex: objHandle.Read() failed")
-		}
-
-		remoteStoreIndex, errno := longtaillib.ReadStoreIndexFromBuffer(blob)
-		if errno != 0 {
-			return false, errors.Wrapf(longtaillib.ErrnoToError(errno, longtaillib.ErrEIO), "updateRemoteStoreIndex: longtaillib.ReadStoreIndexFromBuffer() failed")
-		}
-		defer remoteStoreIndex.Dispose()
-
-		newStoreIndex, errno := longtaillib.MergeStoreIndex(updatedStoreIndex, remoteStoreIndex)
-		if errno != 0 {
-			return false, errors.Wrapf(longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM), "updateRemoteStoreIndex: longtaillib.MergeStoreIndex() failed")
-		}
-		defer newStoreIndex.Dispose()
-
-		storeBlob, errno := longtaillib.WriteStoreIndexToBuffer(newStoreIndex)
-		if errno != 0 {
-			return false, errors.Wrapf(longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM), "updateRemoteStoreIndex: longtaillib.WriteStoreIndexToBuffer() kfailed")
-		}
-
-		ok, err := objHandle.Write(storeBlob)
-		if err != nil {
-			return false, errors.Wrapf(err, "updateRemoteStoreIndex: objHandle.Write() failed")
-		}
-		return ok, nil
-	}
-	storeBlob, errno := longtaillib.WriteStoreIndexToBuffer(updatedStoreIndex)
-	if errno != 0 {
-		return false, errors.Wrapf(longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM), "updateRemoteStoreIndex: WriteStoreIndexToBuffer() failed")
-	}
-
-	ok, err := objHandle.Write(storeBlob)
-	if err != nil {
-		return false, errors.Wrapf(err, "updateRemoteStoreIndex: objHandle.Write() failed")
-	}
-	return ok, nil
-}
-
-func updateRemoteStoreIndex(
-	ctx context.Context,
-	blobClient BlobClient,
-	updatedStoreIndex longtaillib.Longtail_StoreIndex) error {
-
-	key := "store.lsi"
-	objHandle, err := blobClient.NewObject(key)
-	if err != nil {
-		return errors.Wrapf(err, "updateRemoteStoreIndex: blobClient.NewObject(%s) failed", key)
-	}
-	for {
-		ok, err := tryUpdateRemoteStoreIndex(
-			ctx,
-			updatedStoreIndex,
-			objHandle)
-		if ok {
-			return nil
-		}
-		if err != nil {
-			return errors.Wrapf(err, "updateRemoteStoreIndex: tryUpdateRemoteStoreIndex(%s) failed", key)
-		}
-		log.Printf("Retrying updating remote store index %s\n", key)
-	}
-	return nil
-}
-
-func getStoreIndexFromBlocks(
-	ctx context.Context,
-	s *remoteStore,
-	blobClient BlobClient,
-	blockKeys []string) (longtaillib.Longtail_StoreIndex, error) {
-
-	storeIndex, errno := longtaillib.CreateStoreIndexFromBlocks([]longtaillib.Longtail_BlockIndex{})
-	if errno != 0 {
-		return longtaillib.Longtail_StoreIndex{}, longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM)
-	}
-
-	batchCount := runtime.NumCPU()
-	batchStart := 0
-
-	if batchCount > len(blockKeys) {
-		batchCount = len(blockKeys)
-	}
-	clients := make([]BlobClient, batchCount)
-	for c := 0; c < batchCount; c++ {
-		client, err := s.blobStore.NewClient(ctx)
-		if err != nil {
-			storeIndex.Dispose()
-			return longtaillib.Longtail_StoreIndex{}, err
-		}
-		clients[c] = client
-	}
-
-	var wg sync.WaitGroup
-
-	for batchStart < len(blockKeys) {
-		batchLength := batchCount
-		if batchStart+batchLength > len(blockKeys) {
-			batchLength = len(blockKeys) - batchStart
-		}
-		batchBlockIndexes := make([]longtaillib.Longtail_BlockIndex, batchLength)
-		wg.Add(batchLength)
-		for batchPos := 0; batchPos < batchLength; batchPos++ {
-			i := batchStart + batchPos
-			blockKey := blockKeys[i]
-			go func(client BlobClient, batchPos int, blockKey string) {
-				storedBlockData, _, err := readBlobWithRetry(
-					ctx,
-					s,
-					client,
-					blockKey)
-
-				if err != nil {
-					wg.Done()
-					return
-				}
-
-				blockIndex, errno := longtaillib.ReadBlockIndexFromBuffer(storedBlockData)
-				if errno != 0 {
-					wg.Done()
-					return
-				}
-
-				blockPath := GetBlockPath("chunks", blockIndex.GetBlockHash())
-				if blockPath == blockKey {
-					batchBlockIndexes[batchPos] = blockIndex
-				} else {
-					log.Printf("Block %s name does not match content hash, expected name %s\n", blockKey, blockPath)
-				}
-
-				wg.Done()
-			}(clients[batchPos], batchPos, blockKey)
-		}
-		wg.Wait()
-		writeIndex := 0
-		for i, blockIndex := range batchBlockIndexes {
-			if !blockIndex.IsValid() {
-				continue
-			}
-			if i > writeIndex {
-				batchBlockIndexes[writeIndex] = blockIndex
-			}
-			writeIndex++
-		}
-		batchBlockIndexes = batchBlockIndexes[:writeIndex]
-		batchStoreIndex, errno := longtaillib.CreateStoreIndexFromBlocks(batchBlockIndexes)
-		for _, blockIndex := range batchBlockIndexes {
-			blockIndex.Dispose()
-		}
-		if errno != 0 {
-			storeIndex.Dispose()
-			return longtaillib.Longtail_StoreIndex{}, longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM)
-		}
-		newStoreIndex, errno := longtaillib.MergeStoreIndex(storeIndex, batchStoreIndex)
-		batchStoreIndex.Dispose()
-		storeIndex.Dispose()
-		storeIndex = newStoreIndex
-		//		blockIndexes = append(blockIndexes, batchBlockIndexes[:writeIndex]...)
-		batchStart += batchLength
-		log.Printf("Scanned %d/%d blocks in %s\n", batchStart, len(blockKeys), blobClient.String())
-	}
-
-	for c := 0; c < batchCount; c++ {
-		clients[c].Close()
-	}
-
-	return storeIndex, nil
-}
-
 func buildStoreIndexFromStoreBlocks(
 	ctx context.Context,
 	s *remoteStore,
 	blobClient BlobClient) (longtaillib.Longtail_StoreIndex, error) {
 
 	var items []string
-	blobs, err := blobClient.GetObjects()
+	blobs, err := blobClient.GetObjects("chunks")
 	if err != nil {
 		return longtaillib.Longtail_StoreIndex{}, err
 	}
@@ -633,29 +383,9 @@ func storeIndexWorkerReplyErrorState(
 				return
 			}
 		case getExistingContentMessage := <-getExistingContentMessages:
-			getExistingContentMessage.asyncCompleteAPI.OnComplete(longtaillib.Longtail_ContentIndex{}, longtaillib.EINVAL)
+			getExistingContentMessage.asyncCompleteAPI.OnComplete(longtaillib.Longtail_StoreIndex{}, longtaillib.EINVAL)
 		}
 	}
-}
-
-func readStoreStoreIndex(
-	ctx context.Context,
-	s *remoteStore,
-	client BlobClient) (longtaillib.Longtail_StoreIndex, error) {
-
-	key := "store.lsi"
-	blobData, _, err := readBlobWithRetry(ctx, s, client, key)
-	if err != nil {
-		return longtaillib.Longtail_StoreIndex{}, err
-	}
-	if blobData == nil {
-		return longtaillib.Longtail_StoreIndex{}, nil
-	}
-	storeIndex, errno := longtaillib.ReadStoreIndexFromBuffer(blobData)
-	if errno != 0 {
-		return longtaillib.Longtail_StoreIndex{}, errors.Wrapf(longtaillib.ErrnoToError(errno, longtaillib.ErrEIO), "contentIndexWorker: longtaillib.ReadStoreIndexFromBuffer() for %s", key)
-	}
-	return storeIndex, nil
 }
 
 func onPreflighMessage(
@@ -663,13 +393,13 @@ func onPreflighMessage(
 	storeIndex longtaillib.Longtail_StoreIndex,
 	message preflightGetMessage,
 	prefetchBlockMessages chan<- prefetchBlockMessage) {
-	existingContentIndex, errno := longtaillib.GetExistingContentIndex(storeIndex, message.chunkHashes, 0, s.maxBlockSize, s.maxChunksPerBlock)
+	existingStoreIndex, errno := longtaillib.GetExistingStoreIndex(storeIndex, message.chunkHashes, 0)
 	if errno != 0 {
-		log.Printf("WARNING: onPreflighMessage longtaillib.GetExistingContentIndex() failed with %v", longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM))
+		log.Printf("WARNING: onPreflighMessage longtaillib.GetExistingStoreIndex() failed with %v", longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM))
 		return
 	}
-	defer existingContentIndex.Dispose()
-	blockHashes := existingContentIndex.GetBlockHashes()
+	defer existingStoreIndex.Dispose()
+	blockHashes := existingStoreIndex.GetBlockHashes()
 	for _, blockHash := range blockHashes {
 		prefetchBlockMessages <- prefetchBlockMessage{blockHash: blockHash}
 	}
@@ -679,29 +409,12 @@ func onGetExistingContentMessage(
 	s *remoteStore,
 	storeIndex longtaillib.Longtail_StoreIndex,
 	message getExistingContentMessage) {
-	existingContentIndex, errno := longtaillib.GetExistingContentIndex(storeIndex, message.chunkHashes, message.minBlockUsagePercent, s.maxBlockSize, s.maxChunksPerBlock)
+	existingStoreIndex, errno := longtaillib.GetExistingStoreIndex(storeIndex, message.chunkHashes, message.minBlockUsagePercent)
 	if errno != 0 {
-		message.asyncCompleteAPI.OnComplete(longtaillib.Longtail_ContentIndex{}, errno)
+		message.asyncCompleteAPI.OnComplete(longtaillib.Longtail_StoreIndex{}, errno)
 		return
 	}
-	message.asyncCompleteAPI.OnComplete(existingContentIndex, 0)
-}
-
-func updateStoreIndex(
-	storeIndex longtaillib.Longtail_StoreIndex,
-	addedBlockIndexes []longtaillib.Longtail_BlockIndex) (longtaillib.Longtail_StoreIndex, error) {
-	addedStoreIndex, errno := longtaillib.CreateStoreIndexFromBlocks(addedBlockIndexes)
-	if errno != 0 {
-		return longtaillib.Longtail_StoreIndex{}, errors.Wrap(longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM), "contentIndexWorker: longtaillib.CreateStoreIndexFromBlocks() failed")
-	}
-
-	updatedStoreIndex, errno := longtaillib.MergeStoreIndex(addedStoreIndex, storeIndex)
-	addedStoreIndex.Dispose()
-	if errno != 0 {
-		updatedStoreIndex.Dispose()
-		return longtaillib.Longtail_StoreIndex{}, errors.Wrap(longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM), "contentIndexWorker: longtaillib.MergeStoreIndex() failed")
-	}
-	return updatedStoreIndex, nil
+	message.asyncCompleteAPI.OnComplete(existingStoreIndex, 0)
 }
 
 func contentIndexWorker(
@@ -730,7 +443,7 @@ func contentIndexWorker(
 	if accessType == Init {
 		saveStoreIndex = true
 	} else {
-		storeIndex, err = readStoreStoreIndex(ctx, s, client)
+		storeIndex, err = readStoreIndex(client)
 		if err != nil {
 			log.Printf("contentIndexWorker: readStoreStoreIndex() failed with %v", err)
 		}
@@ -755,7 +468,7 @@ func contentIndexWorker(
 				return errors.Wrapf(longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM), "contentIndexWorker: buildStoreIndexFromStoreBlocks() failed")
 			}
 			log.Printf("Rebuilt remote index with %d blocks\n", len(storeIndex.GetBlockHashes()))
-			err := updateRemoteStoreIndex(ctx, client, storeIndex)
+			err := writeStoreIndex(client, storeIndex)
 			if err != nil {
 				log.Printf("Failed to update store index in store %s\n", s.String())
 				saveStoreIndex = true
@@ -775,7 +488,7 @@ func contentIndexWorker(
 		received := 0
 		select {
 		case preflightGetMsg := <-preflightGetMessages:
-			received += 1
+			received++
 			if len(addedBlockIndexes) > 0 {
 				updatedStoreIndex, err := updateStoreIndex(storeIndex, addedBlockIndexes)
 				if err != nil {
@@ -784,30 +497,26 @@ func contentIndexWorker(
 				}
 				storeIndex.Dispose()
 				storeIndex = updatedStoreIndex
-				saveStoreIndex = true
-				addedBlockIndexes = nil
 			}
 			onPreflighMessage(s, storeIndex, preflightGetMsg, prefetchBlockMessages)
 		case blockIndexMsg, more := <-blockIndexMessages:
 			if more {
-				received += 1
+				received++
 				addedBlockIndexes = append(addedBlockIndexes, blockIndexMsg.blockIndex)
 			} else {
 				run = false
 			}
 		case getExistingContentMessage := <-getExistingContentMessages:
-			received += 1
+			received++
 			if len(addedBlockIndexes) > 0 {
 				updatedStoreIndex, err := updateStoreIndex(storeIndex, addedBlockIndexes)
 				if err != nil {
 					log.Printf("WARNING: Failed to update store index with added blocks %v", err)
-					getExistingContentMessage.asyncCompleteAPI.OnComplete(longtaillib.Longtail_ContentIndex{}, longtaillib.ErrorToErrno(err, longtaillib.EIO))
+					getExistingContentMessage.asyncCompleteAPI.OnComplete(longtaillib.Longtail_StoreIndex{}, longtaillib.ErrorToErrno(err, longtaillib.EIO))
 					continue
 				}
 				storeIndex.Dispose()
 				storeIndex = updatedStoreIndex
-				saveStoreIndex = true
-				addedBlockIndexes = nil
 			}
 			onGetExistingContentMessage(s, storeIndex, getExistingContentMessage)
 		default:
@@ -826,8 +535,6 @@ func contentIndexWorker(
 					}
 					storeIndex.Dispose()
 					storeIndex = updatedStoreIndex
-					saveStoreIndex = true
-					addedBlockIndexes = nil
 				}
 				onPreflighMessage(s, storeIndex, preflightGetMsg, prefetchBlockMessages)
 			case blockIndexMsg, more := <-blockIndexMessages:
@@ -841,13 +548,11 @@ func contentIndexWorker(
 					updatedStoreIndex, err := updateStoreIndex(storeIndex, addedBlockIndexes)
 					if err != nil {
 						log.Printf("WARNING: Failed to update store index with added blocks %v", err)
-						getExistingContentMessage.asyncCompleteAPI.OnComplete(longtaillib.Longtail_ContentIndex{}, longtaillib.ErrorToErrno(err, longtaillib.EIO))
+						getExistingContentMessage.asyncCompleteAPI.OnComplete(longtaillib.Longtail_StoreIndex{}, longtaillib.ErrorToErrno(err, longtaillib.EIO))
 						continue
 					}
 					storeIndex.Dispose()
 					storeIndex = updatedStoreIndex
-					saveStoreIndex = true
-					addedBlockIndexes = nil
 				}
 				onGetExistingContentMessage(s, storeIndex, getExistingContentMessage)
 			}
@@ -859,33 +564,16 @@ func contentIndexWorker(
 	}
 
 	if len(addedBlockIndexes) > 0 {
-		updatedStoreIndex, err := updateStoreIndex(storeIndex, addedBlockIndexes)
-		if err != nil {
-			return errors.Wrapf(err, "WARNING: Failed to update store index with added blocks")
-		}
-		storeIndex.Dispose()
-		storeIndex = updatedStoreIndex
 		saveStoreIndex = true
-		addedBlockIndexes = nil
 	}
 
 	if saveStoreIndex {
-		err := updateRemoteStoreIndex(ctx, client, storeIndex)
-		if err != nil {
-			log.Printf("Retrying store index in store %s\n", s.String())
-			err = updateRemoteStoreIndex(ctx, client, storeIndex)
+		addedStoreIndex, errno := longtaillib.CreateStoreIndexFromBlocks(addedBlockIndexes)
+		defer addedStoreIndex.Dispose()
+		if errno != 0 {
+			return errors.Wrap(longtaillib.ErrnoToError(errno, longtaillib.ErrENOMEM), s.blobStore.String())
 		}
-		if err != nil {
-			log.Printf("Retrying 500 ms delayed store index in store %s\n", s.String())
-			time.Sleep(500 * time.Millisecond)
-			err = updateRemoteStoreIndex(ctx, client, storeIndex)
-		}
-		if err != nil {
-			log.Printf("Retrying 2 s delayed store index in store %s\n", s.String())
-			time.Sleep(2 * time.Second)
-			err = updateRemoteStoreIndex(ctx, client, storeIndex)
-		}
-
+		err := writeStoreIndex(client, addedStoreIndex)
 		if err != nil {
 			storeIndexWorkerReplyErrorState(blockIndexMessages, getExistingContentMessages, flushMessages, flushReplyMessages)
 		}
@@ -897,8 +585,6 @@ func contentIndexWorker(
 func NewRemoteBlockStore(
 	jobAPI longtaillib.Longtail_JobAPI,
 	blobStore BlobStore,
-	maxBlockSize uint32,
-	maxChunksPerBlock uint32,
 	accessType AccessType) (longtaillib.BlockStoreAPI, error) {
 	ctx := context.Background()
 	defaultClient, err := blobStore.NewClient(ctx)
@@ -907,11 +593,9 @@ func NewRemoteBlockStore(
 	}
 
 	s := &remoteStore{
-		jobAPI:            jobAPI,
-		maxBlockSize:      maxBlockSize,
-		maxChunksPerBlock: maxChunksPerBlock,
-		blobStore:         blobStore,
-		defaultClient:     defaultClient}
+		jobAPI:        jobAPI,
+		blobStore:     blobStore,
+		defaultClient: defaultClient}
 
 	s.workerCount = runtime.NumCPU()
 	s.putBlockChan = make(chan putBlockMessage, s.workerCount*8)

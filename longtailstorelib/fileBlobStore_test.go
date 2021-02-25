@@ -22,7 +22,8 @@ func TestFSBlobStore(t *testing.T) {
 	if err != nil {
 		t.Errorf("client.NewObject() err == %q", err)
 	}
-	ok, err := object.Write([]byte("apa"))
+	testData := []byte("apa")
+	ok, err := object.Write(testData)
 	if !ok {
 		t.Errorf("object.Write() ok != true")
 	}

@@ -5,7 +5,6 @@ import "context"
 // BlobObject
 type BlobObject interface {
 	Exists() (bool, error)
-	LockWriteVersion() (bool, error)
 	Read() ([]byte, error)
 	Write(data []byte) (bool, error)
 	Delete() error
@@ -19,7 +18,7 @@ type BlobProperties struct {
 // BlobClient
 type BlobClient interface {
 	NewObject(path string) (BlobObject, error)
-	GetObjects() ([]BlobProperties, error)
+	GetObjects(pathPrefix string) ([]BlobProperties, error)
 	String() string
 	Close()
 }

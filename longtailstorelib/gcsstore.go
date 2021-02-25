@@ -25,17 +25,15 @@ type gcsBlobClient struct {
 }
 
 type gcsBlobObject struct {
-	objHandle      *storage.ObjectHandle
-	ctx            context.Context
-	path           string
-	writeCondition *storage.Conditions
-	client         *gcsBlobClient
+	objHandle *storage.ObjectHandle
+	ctx       context.Context
+	path      string
+	client    *gcsBlobClient
 }
 
 const (
 	// If the meta generation changes between our lock and write/close we get a gcs error with code 412
-	writeConditionFailed = 412
-	rateLimitExceeded    = 429
+	rateLimitExceeded = 429
 )
 
 // NewGCSBlobStore ...
@@ -74,18 +72,17 @@ func (blobClient *gcsBlobClient) NewObject(path string) (BlobObject, error) {
 	gcsPath := blobClient.store.prefix + path
 	objHandle := blobClient.bucket.Object(gcsPath)
 	return &gcsBlobObject{
-			objHandle:      objHandle,
-			ctx:            blobClient.ctx,
-			path:           gcsPath,
-			writeCondition: nil,
-			client:         blobClient},
+			objHandle: objHandle,
+			ctx:       blobClient.ctx,
+			path:      gcsPath,
+			client:    blobClient},
 		nil
 }
 
-func (blobClient *gcsBlobClient) GetObjects() ([]BlobProperties, error) {
+func (blobClient *gcsBlobClient) GetObjects(pathPrefix string) ([]BlobProperties, error) {
 	var items []BlobProperties
 	it := blobClient.bucket.Objects(blobClient.ctx, &storage.Query{
-		Prefix: blobClient.store.prefix,
+		Prefix: blobClient.store.prefix + pathPrefix,
 	})
 
 	for {
@@ -112,30 +109,23 @@ func (blobClient *gcsBlobClient) String() string {
 
 func (blobObject *gcsBlobObject) Read() ([]byte, error) {
 	reader, err := blobObject.objHandle.NewReader(blobObject.ctx)
+	if err == storage.ErrObjectNotExist {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, blobObject.path)
 	}
 	data, err := ioutil.ReadAll(reader)
 	err2 := reader.Close()
+	if err == storage.ErrObjectNotExist || err2 == storage.ErrObjectNotExist {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, blobObject.path)
 	} else if err2 != nil {
 		return nil, err2
 	}
 	return data, nil
-}
-
-func (blobObject *gcsBlobObject) LockWriteVersion() (bool, error) {
-	objAttrs, err := blobObject.objHandle.Attrs(blobObject.ctx)
-	if err == storage.ErrObjectNotExist {
-		blobObject.writeCondition = &storage.Conditions{DoesNotExist: true}
-		return false, nil
-	} else if err != nil {
-		return false, err
-	}
-
-	blobObject.writeCondition = &storage.Conditions{GenerationMatch: objAttrs.Generation, DoesNotExist: false}
-	return true, nil
 }
 
 func (blobObject *gcsBlobObject) Exists() (bool, error) {
@@ -150,12 +140,7 @@ func (blobObject *gcsBlobObject) Exists() (bool, error) {
 }
 
 func (blobObject *gcsBlobObject) Write(data []byte) (bool, error) {
-	var writer *storage.Writer
-	if blobObject.writeCondition == nil {
-		writer = blobObject.objHandle.NewWriter(blobObject.ctx)
-	} else {
-		writer = blobObject.objHandle.If(*blobObject.writeCondition).NewWriter(blobObject.ctx)
-	}
+	writer := blobObject.objHandle.NewWriter(blobObject.ctx)
 
 	_, err := writer.Write(data)
 	err2 := writer.Close()
@@ -163,7 +148,7 @@ func (blobObject *gcsBlobObject) Write(data []byte) (bool, error) {
 		return false, errors.Wrap(err, blobObject.path)
 	}
 	if e, ok := err2.(*googleapi.Error); ok {
-		if e.Code == writeConditionFailed || e.Code == rateLimitExceeded {
+		if e.Code == rateLimitExceeded {
 			return false, nil
 		}
 		return false, err2
@@ -186,10 +171,6 @@ func (blobObject *gcsBlobObject) Delete() error {
 	if err != nil {
 		return err
 	}
-	if blobObject.writeCondition == nil {
-		err = blobObject.objHandle.Delete(blobObject.ctx)
-	} else {
-		err = blobObject.objHandle.If(*blobObject.writeCondition).Delete(blobObject.ctx)
-	}
+	err = blobObject.objHandle.Delete(blobObject.ctx)
 	return err
 }
